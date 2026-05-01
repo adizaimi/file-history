@@ -51,43 +51,28 @@
 # Requirements:
 #   - POSIX shell utilities: diff, cp, date, mktemp
 #   - A SHA-1 utility: sha1sum (Linux) or shasum (macOS)
+#   - git (only needed when reconstructing .base from .patches.mbox)
 
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 FILE [message...]" >&2
+  cat >&2 <<'EOF'
+Usage:
+  file-history.sh commit|ci FILE [message...]
+  file-history.sh diff FILE
+
+Commands:
+  commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
+  diff         Show working diff between .FILE.base and FILE (like git diff)
+
+Notes:
+  - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
+    by applying the mbox in a temporary git repo and copying the resulting file.
+  - Running without a command prints this usage.
+EOF
   exit 1
 }
 
-# Require at least one argument (file)
-[ $# -ge 1 ] || usage
-
-file="$1"
-shift || true  # remaining args = commit message
-
-if [ ! -f "$file" ]; then
-  echo "Error: file '$file' does not exist" >&2
-  exit 1
-fi
-
-dir="$(cd "$(dirname "$file")" && pwd)"
-name="$(basename "$file")"
-
-base="$dir/.${name}.base"              # last committed snapshot
-mbox="$dir/.${name}.patches.mbox"      # mbox-style series
-
-msg="$*"
-[ -z "$msg" ] && msg="no message"
-
-# Author info (use git env vars if set)
-author_name="${GIT_AUTHOR_NAME:-Local User}"
-author_email="${GIT_AUTHOR_EMAIL:-local@example.com}"
-
-# Timestamps
-date_rfc="$(date -R)"                     # for Date: header
-date_from="$(date '+%a %b %d %T %Y')"    # for "From " line
-
-# Synthetic commit id (40-hex, like a SHA-1)
 sha1_hex() {
   if command -v sha1sum >/dev/null 2>&1; then
     sha1sum | awk '{print $1}'
@@ -100,6 +85,112 @@ sha1_hex() {
   return 1
 }
 
+ensure_base_from_mbox() {
+  local file="$1"
+  local base="$2"
+  local mbox="$3"
+  local name="$4"
+
+  # If base already exists, nothing to do.
+  if [ -f "$base" ]; then
+    return 0
+  fi
+
+  # No base and no mbox means nothing to reconstruct.
+  if [ ! -f "$mbox" ]; then
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Error: '$base' is missing and git is required to reconstruct from '$mbox'" >&2
+    exit 1
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+
+  # Best-effort cleanup of temp directory.
+  cleanup_tmpdir() {
+    rm -rf "$tmpdir"
+  }
+  trap cleanup_tmpdir RETURN
+
+  git -C "$tmpdir" init >/dev/null 2>&1
+  git -C "$tmpdir" config user.name "${GIT_AUTHOR_NAME:-Local User}" >/dev/null 2>&1
+  git -C "$tmpdir" config user.email "${GIT_AUTHOR_EMAIL:-local@example.com}" >/dev/null 2>&1
+  git -C "$tmpdir" am "$mbox" >/dev/null 2>&1
+
+  if [ -f "$tmpdir/$name" ]; then
+    cp "$tmpdir/$name" "$base"
+    echo "Reconstructed base snapshot '$base' from '$mbox'"
+  else
+    echo "Error: could not reconstruct '$name' from '$mbox'" >&2
+    exit 1
+  fi
+}
+
+# Running with no args now prints usage by design.
+[ $# -ge 1 ] || usage
+
+cmd="$1"
+shift
+
+case "$cmd" in
+  commit|ci|diff)
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+[ $# -ge 1 ] || usage
+
+file="$1"
+shift || true
+
+if [ "$cmd" = "diff" ] && [ $# -ne 0 ]; then
+  usage
+fi
+
+if [ ! -f "$file" ]; then
+  echo "Error: file '$file' does not exist" >&2
+  exit 1
+fi
+
+dir="$(cd "$(dirname "$file")" && pwd)"
+name="$(basename "$file")"
+
+base="$dir/.${name}.base"              # last committed snapshot
+mbox="$dir/.${name}.patches.mbox"      # mbox-style series
+
+if [ "$cmd" = "commit" ] || [ "$cmd" = "ci" ]; then
+  msg="$*"
+  [ -z "$msg" ] && msg="no message"
+fi
+
+# If base is missing, try to reconstruct from existing mbox history.
+ensure_base_from_mbox "$file" "$base" "$mbox" "$name"
+
+if [ "$cmd" = "diff" ]; then
+  if [ ! -f "$base" ]; then
+    # No historical base; show add-from-empty view.
+    diff -u --label "/dev/null" --label "b/$name" -- /dev/null "$file" || true
+    exit 0
+  fi
+
+  diff -u --label "a/$name" --label "b/$name" -- "$base" "$file" || true
+  exit 0
+fi
+
+# Author info (use git env vars if set)
+author_name="${GIT_AUTHOR_NAME:-Local User}"
+author_email="${GIT_AUTHOR_EMAIL:-local@example.com}"
+
+# Timestamps
+date_rfc="$(date -R)"                     # for Date: header
+date_from="$(date '+%a %b %d %T %Y')"    # for "From " line
+
+# Synthetic commit id (40-hex, like a SHA-1)
 commit_id="$(
   { printf '%s\n' "$date_rfc"; printf '%s\n' "$file"; printf '%s\n' "$msg"; } \
     | sha1_hex 2>/dev/null || true
