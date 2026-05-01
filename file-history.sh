@@ -61,11 +61,13 @@ Usage:
   file-history.sh commit|ci FILE [message...]
   file-history.sh diff FILE
   file-history.sh vimdiff FILE
+  file-history.sh log FILE
 
 Commands:
   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
   diff         Show working diff between .FILE.base and FILE (like git diff)
   vimdiff      Open interactive diff between .FILE.base and FILE
+  log          List recorded patch commits from .FILE.patches.mbox
 
 Notes:
   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
@@ -138,7 +140,7 @@ cmd="$1"
 shift
 
 case "$cmd" in
-  commit|ci|diff|vimdiff)
+  commit|ci|diff|vimdiff|log)
     ;;
   *)
     usage
@@ -150,7 +152,7 @@ esac
 file="$1"
 shift || true
 
-if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" ]] && [ $# -ne 0 ]; then
+if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" ]] && [ $# -ne 0 ]; then
   usage
 fi
 
@@ -168,6 +170,63 @@ mbox="$dir/.${name}.patches.mbox"      # mbox-style series
 if [ "$cmd" = "commit" ] || [ "$cmd" = "ci" ]; then
   msg="$*"
   [ -z "$msg" ] && msg="no message"
+fi
+
+if [ "$cmd" = "log" ]; then
+  if [ ! -f "$mbox" ]; then
+    echo "No recorded history for '$file'"
+    exit 0
+  fi
+
+  awk '
+    BEGIN {
+      n = 0
+      date = "-"
+      in_subject = 0
+      subject = ""
+    }
+
+    function flush_subject() {
+      if (in_subject) {
+        n++
+        printf "%4d  %s  %s\n", n, date, subject
+        date = "-"
+        in_subject = 0
+        subject = ""
+      }
+    }
+
+    {
+      if (in_subject && $0 !~ /^[ \t]/) {
+        flush_subject()
+      }
+    }
+
+    /^Date: / {
+      date = substr($0, 7)
+      next
+    }
+
+    /^Subject: \[PATCH[^]]*\] / {
+      subject = $0
+      sub(/^Subject: \[PATCH[^]]*\] /, "", subject)
+      in_subject = 1
+      next
+    }
+
+    in_subject && /^[ \t]/ {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      subject = subject " " line
+      next
+    }
+
+    END {
+      flush_subject()
+    }
+  ' "$mbox"
+
+  exit 0
 fi
 
 # If base is missing, try to reconstruct from existing mbox history.
