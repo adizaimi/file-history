@@ -60,10 +60,12 @@ usage() {
 Usage:
   file-history.sh commit|ci FILE [message...]
   file-history.sh diff FILE
+  file-history.sh vimdiff FILE
 
 Commands:
   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
   diff         Show working diff between .FILE.base and FILE (like git diff)
+  vimdiff      Open interactive diff between .FILE.base and FILE
 
 Notes:
   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
@@ -136,7 +138,7 @@ cmd="$1"
 shift
 
 case "$cmd" in
-  commit|ci|diff)
+  commit|ci|diff|vimdiff)
     ;;
   *)
     usage
@@ -148,7 +150,7 @@ esac
 file="$1"
 shift || true
 
-if [ "$cmd" = "diff" ] && [ $# -ne 0 ]; then
+if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" ]] && [ $# -ne 0 ]; then
   usage
 fi
 
@@ -179,6 +181,24 @@ if [ "$cmd" = "diff" ]; then
   fi
 
   diff -u --label "a/$name" --label "b/$name" -- "$base" "$file" || true
+  exit 0
+fi
+
+if [ "$cmd" = "vimdiff" ]; then
+  if ! command -v vimdiff >/dev/null 2>&1; then
+    echo "Error: vimdiff is not installed or not in PATH" >&2
+    exit 1
+  fi
+
+  if [ ! -f "$base" ]; then
+    echo "No historical base; opening add-from-empty view."
+    local_empty="$(mktemp)"
+    vimdiff "$local_empty" "$file"
+    rm -f "$local_empty"
+    exit 0
+  fi
+
+  vimdiff "$base" "$file"
   exit 0
 fi
 
