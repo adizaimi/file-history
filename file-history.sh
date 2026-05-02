@@ -62,12 +62,14 @@ Usage:
   file-history.sh diff FILE
   file-history.sh vimdiff FILE
   file-history.sh log FILE
+  file-history.sh show FILE
 
 Commands:
   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
   diff         Show working diff between .FILE.base and FILE (like git diff)
   vimdiff      Open interactive diff between .FILE.base and FILE
   log          List recorded patch commits from .FILE.patches.mbox
+  show         Print the last patch entry from .FILE.patches.mbox (like git show)
 
 Notes:
   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
@@ -140,7 +142,7 @@ cmd="$1"
 shift
 
 case "$cmd" in
-  commit|ci|diff|vimdiff|log)
+  commit|ci|diff|vimdiff|log|show)
     ;;
   *)
     usage
@@ -152,7 +154,7 @@ esac
 file="$1"
 shift || true
 
-if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" ]] && [ $# -ne 0 ]; then
+if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" || "$cmd" = "show" ]] && [ $# -ne 0 ]; then
   usage
 fi
 
@@ -223,6 +225,48 @@ if [ "$cmd" = "log" ]; then
 
     END {
       flush_subject()
+    }
+  ' "$mbox"
+
+  exit 0
+fi
+
+if [ "$cmd" = "show" ]; then
+  if [ ! -f "$mbox" ]; then
+    echo "No recorded history for '$file'"
+    exit 0
+  fi
+
+  awk '
+    BEGIN {
+      have_last = 0
+      current = ""
+    }
+
+    /^From [0-9a-f][0-9a-f]* / {
+      if (current != "") {
+        last = current
+        have_last = 1
+      }
+      current = $0 ORS
+      next
+    }
+
+    {
+      current = current $0 ORS
+    }
+
+    END {
+      if (current != "") {
+        last = current
+        have_last = 1
+      }
+
+      if (!have_last) {
+        exit 1
+      }
+
+      printf "%s", last
     }
   ' "$mbox"
 
