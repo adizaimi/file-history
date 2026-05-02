@@ -1,0 +1,602 @@
+From 5d85bee36503c904a6b4daa50eb46198bf358bc8 Fri May 01 11:55:40 2026
+From: Adi Zaimi <adizaimi@yahoo.com>
+Date: Fri, 01 May 2026 11:55:40 -0400
+Subject: [PATCH] Initial import
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--- /dev/null
++++ b/file-history.sh
+@@ -0,0 +1,153 @@
++#!/usr/bin/env bash
++# file-history.sh
++#
++# Lightweight, file-local change history that can later be imported into Git.
++#
++# This script records incremental changes to a single file as a series of
++# mbox-style patch emails, similar to `git format-patch --stdout`. Each
++# invocation:
++#
++#   - compares the target file against the last saved snapshot
++#   - generates a unified diff (with a/FILE and b/FILE labels)
++#   - wraps that diff in an email-like header (From, Date, Subject, etc.)
++#   - appends it to a single .mbox file next to the target
++#   - updates the snapshot for the next run
++#
++# No Git repository is needed while you iterate; you just run this script on
++# your standalone file whenever you want to "commit" a change with a message.
++#
++# Files created next to the target FILE:
++#   .FILE.base          - last committed snapshot of FILE
++#   .FILE.patches.mbox  - mbox containing one patch email per invocation
++#
++# Usage:
++#   file-history.sh FILE [message...]
++#
++# Examples:
++#   ./file-history.sh script.py "initial version"
++#   # edit script.py...
++#   ./file-history.sh script.py "add foo() helper"
++#   # edit script.py...
++#   ./file-history.sh script.py "fix edge case in foo()"
++#
++# If [message...] is omitted, the script uses "no message".
++#
++# Importing the history into Git later:
++#
++#   1. Create or cd into a Git repo:
++#        git init my-repo
++#        cd my-repo
++#
++#   2. Copy only the mbox (do NOT pre-copy the target file):
++#        cp /path/to/.script.py.patches.mbox .
++#
++#   3. Apply the recorded history as real Git commits:
++#        git am .script.py.patches.mbox
++#
++# Each recorded change becomes its own commit (with the message you supplied),
++# preserving the per-"commit" boundaries exactly like a `git format-patch`
++# series.
++#
++# Requirements:
++#   - POSIX shell utilities: diff, cp, date, mktemp
++#   - A SHA-1 utility: sha1sum (Linux) or shasum (macOS)
++
++set -euo pipefail
++
++usage() {
++  echo "Usage: $0 FILE [message...]" >&2
++  exit 1
++}
++
++# Require at least one argument (file)
++[ $# -ge 1 ] || usage
++
++file="$1"
++shift || true  # remaining args = commit message
++
++if [ ! -f "$file" ]; then
++  echo "Error: file '$file' does not exist" >&2
++  exit 1
++fi
++
++dir="$(cd "$(dirname "$file")" && pwd)"
++name="$(basename "$file")"
++
++base="$dir/.${name}.base"              # last committed snapshot
++mbox="$dir/.${name}.patches.mbox"      # mbox-style series
++
++msg="$*"
++[ -z "$msg" ] && msg="no message"
++
++# Author info (use git env vars if set)
++author_name="${GIT_AUTHOR_NAME:-Local User}"
++author_email="${GIT_AUTHOR_EMAIL:-local@example.com}"
++
++# Timestamps
++date_rfc="$(date -R)"                     # for Date: header
++date_from="$(date '+%a %b %d %T %Y')"    # for "From " line
++
++# Synthetic commit id (40-hex, like a SHA-1)
++sha1_hex() {
++  if command -v sha1sum >/dev/null 2>&1; then
++    sha1sum | awk '{print $1}'
++    return
++  fi
++  if command -v shasum >/dev/null 2>&1; then
++    shasum -a 1 | awk '{print $1}'
++    return
++  fi
++  return 1
++}
++
++commit_id="$(
++  { printf '%s\n' "$date_rfc"; printf '%s\n' "$file"; printf '%s\n' "$msg"; } \
++    | sha1_hex 2>/dev/null || true
++)"
++
++# Fallback if sha1sum is missing
++if [ -z "$commit_id" ]; then
++  commit_id="$(printf '%040d' "$(date +%s)")"
++fi
++
++# Generate unified diff with proper labels.
++# First run uses /dev/null so replay creates the file cleanly via git am.
++tmp_old=""
++if [ ! -f "$base" ]; then
++  diff_output="$(
++    diff -u --label "/dev/null" --label "b/$name" -- /dev/null "$file" || true
++  )"
++else
++  old="$base"
++  diff_output="$(
++    diff -u --label "a/$name" --label "b/$name" -- "$old" "$file" || true
++  )"
++fi
++
++# If there is no diff, don't write an empty patch email
++if [ -z "$diff_output" ]; then
++  echo "No changes; nothing recorded."
++  [ -n "$tmp_old" ] && rm -f "$tmp_old"
++  exit 0
++fi
++
++{
++  # mbox "From " line
++  echo "From $commit_id $date_from"
++  echo "From: $author_name <$author_email>"
++  echo "Date: $date_rfc"
++  echo "Subject: [PATCH] $msg"
++  echo "MIME-Version: 1.0"
++  echo "Content-Type: text/plain; charset=UTF-8"
++  echo "Content-Transfer-Encoding: 8bit"
++  echo
++  echo "$diff_output"
++  echo
++} >> "$mbox"
++
++# Update base snapshot for next run
++cp "$file" "$base"
++
++[ -n "$tmp_old" ] && rm -f "$tmp_old"
++
++echo "Recorded patch for '$file' into '$mbox'"
+
+From 6667f388755adff8ee4d7f10b756588ec4fbfd51 Fri May 01 12:24:45 2026
+From: Adi Zaimi <adizaimi@yahoo.com>
+Date: Fri, 01 May 2026 12:24:45 -0400
+Subject: [PATCH] Add diff, checkin subcommands, and ability to recover without base file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--- a/file-history.sh
++++ b/file-history.sh
+@@ -51,20 +51,107 @@
+ # Requirements:
+ #   - POSIX shell utilities: diff, cp, date, mktemp
+ #   - A SHA-1 utility: sha1sum (Linux) or shasum (macOS)
++#   - git (only needed when reconstructing .base from .patches.mbox)
+ 
+ set -euo pipefail
+ 
+ usage() {
+-  echo "Usage: $0 FILE [message...]" >&2
++  cat >&2 <<'EOF'
++Usage:
++  file-history.sh commit|ci FILE [message...]
++  file-history.sh diff FILE
++
++Commands:
++  commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
++  diff         Show working diff between .FILE.base and FILE (like git diff)
++
++Notes:
++  - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
++    by applying the mbox in a temporary git repo and copying the resulting file.
++  - Running without a command prints this usage.
++EOF
+   exit 1
+ }
+ 
+-# Require at least one argument (file)
++sha1_hex() {
++  if command -v sha1sum >/dev/null 2>&1; then
++    sha1sum | awk '{print $1}'
++    return
++  fi
++  if command -v shasum >/dev/null 2>&1; then
++    shasum -a 1 | awk '{print $1}'
++    return
++  fi
++  return 1
++}
++
++ensure_base_from_mbox() {
++  local file="$1"
++  local base="$2"
++  local mbox="$3"
++  local name="$4"
++
++  # If base already exists, nothing to do.
++  if [ -f "$base" ]; then
++    return 0
++  fi
++
++  # No base and no mbox means nothing to reconstruct.
++  if [ ! -f "$mbox" ]; then
++    return 0
++  fi
++
++  if ! command -v git >/dev/null 2>&1; then
++    echo "Error: '$base' is missing and git is required to reconstruct from '$mbox'" >&2
++    exit 1
++  fi
++
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++
++  # Best-effort cleanup of temp directory.
++  cleanup_tmpdir() {
++    rm -rf "$tmpdir"
++  }
++  trap cleanup_tmpdir RETURN
++
++  git -C "$tmpdir" init >/dev/null 2>&1
++  git -C "$tmpdir" config user.name "${GIT_AUTHOR_NAME:-Local User}" >/dev/null 2>&1
++  git -C "$tmpdir" config user.email "${GIT_AUTHOR_EMAIL:-local@example.com}" >/dev/null 2>&1
++  git -C "$tmpdir" am "$mbox" >/dev/null 2>&1
++
++  if [ -f "$tmpdir/$name" ]; then
++    cp "$tmpdir/$name" "$base"
++    echo "Reconstructed base snapshot '$base' from '$mbox'"
++  else
++    echo "Error: could not reconstruct '$name' from '$mbox'" >&2
++    exit 1
++  fi
++}
++
++# Running with no args now prints usage by design.
+ [ $# -ge 1 ] || usage
+ 
++cmd="$1"
++shift
++
++case "$cmd" in
++  commit|ci|diff)
++    ;;
++  *)
++    usage
++    ;;
++esac
++
++[ $# -ge 1 ] || usage
++
+ file="$1"
+-shift || true  # remaining args = commit message
++shift || true
+ 
++if [ "$cmd" = "diff" ] && [ $# -ne 0 ]; then
++  usage
++fi
++
+ if [ ! -f "$file" ]; then
+   echo "Error: file '$file' does not exist" >&2
+   exit 1
+@@ -76,9 +163,25 @@
+ base="$dir/.${name}.base"              # last committed snapshot
+ mbox="$dir/.${name}.patches.mbox"      # mbox-style series
+ 
+-msg="$*"
+-[ -z "$msg" ] && msg="no message"
++if [ "$cmd" = "commit" ] || [ "$cmd" = "ci" ]; then
++  msg="$*"
++  [ -z "$msg" ] && msg="no message"
++fi
+ 
++# If base is missing, try to reconstruct from existing mbox history.
++ensure_base_from_mbox "$file" "$base" "$mbox" "$name"
++
++if [ "$cmd" = "diff" ]; then
++  if [ ! -f "$base" ]; then
++    # No historical base; show add-from-empty view.
++    diff -u --label "/dev/null" --label "b/$name" -- /dev/null "$file" || true
++    exit 0
++  fi
++
++  diff -u --label "a/$name" --label "b/$name" -- "$base" "$file" || true
++  exit 0
++fi
++
+ # Author info (use git env vars if set)
+ author_name="${GIT_AUTHOR_NAME:-Local User}"
+ author_email="${GIT_AUTHOR_EMAIL:-local@example.com}"
+@@ -88,18 +191,6 @@
+ date_from="$(date '+%a %b %d %T %Y')"    # for "From " line
+ 
+ # Synthetic commit id (40-hex, like a SHA-1)
+-sha1_hex() {
+-  if command -v sha1sum >/dev/null 2>&1; then
+-    sha1sum | awk '{print $1}'
+-    return
+-  fi
+-  if command -v shasum >/dev/null 2>&1; then
+-    shasum -a 1 | awk '{print $1}'
+-    return
+-  fi
+-  return 1
+-}
+-
+ commit_id="$(
+   { printf '%s\n' "$date_rfc"; printf '%s\n' "$file"; printf '%s\n' "$msg"; } \
+     | sha1_hex 2>/dev/null || true
+
+From 4676717e60d5e8ce515875e12aecfe82536b517f Fri May 01 12:32:50 2026
+From: Adi Zaimi <adizaimi@yahoo.com>
+Date: Fri, 01 May 2026 12:32:50 -0400
+Subject: [PATCH] Added vimdiff subcommand
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--- a/file-history.sh
++++ b/file-history.sh
+@@ -60,10 +60,12 @@
+ Usage:
+   file-history.sh commit|ci FILE [message...]
+   file-history.sh diff FILE
++  file-history.sh vimdiff FILE
+ 
+ Commands:
+   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
+   diff         Show working diff between .FILE.base and FILE (like git diff)
++  vimdiff      Open interactive diff between .FILE.base and FILE
+ 
+ Notes:
+   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
+@@ -136,7 +138,7 @@
+ shift
+ 
+ case "$cmd" in
+-  commit|ci|diff)
++  commit|ci|diff|vimdiff)
+     ;;
+   *)
+     usage
+@@ -148,7 +150,7 @@
+ file="$1"
+ shift || true
+ 
+-if [ "$cmd" = "diff" ] && [ $# -ne 0 ]; then
++if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" ]] && [ $# -ne 0 ]; then
+   usage
+ fi
+ 
+@@ -182,6 +184,24 @@
+   exit 0
+ fi
+ 
++if [ "$cmd" = "vimdiff" ]; then
++  if ! command -v vimdiff >/dev/null 2>&1; then
++    echo "Error: vimdiff is not installed or not in PATH" >&2
++    exit 1
++  fi
++
++  if [ ! -f "$base" ]; then
++    echo "No historical base; opening add-from-empty view."
++    local_empty="$(mktemp)"
++    vimdiff "$local_empty" "$file"
++    rm -f "$local_empty"
++    exit 0
++  fi
++
++  vimdiff "$base" "$file"
++  exit 0
++fi
++
+ # Author info (use git env vars if set)
+ author_name="${GIT_AUTHOR_NAME:-Local User}"
+ author_email="${GIT_AUTHOR_EMAIL:-local@example.com}"
+
+From ada261812266bcc80f9b12bf3f9edc31fa9587ba Fri May 01 12:51:11 2026
+From: Adi Zaimi <adizaimi@yahoo.com>
+Date: Fri, 01 May 2026 12:51:11 -0400
+Subject: [PATCH] Added a log subcommand to show the history
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--- a/file-history.sh
++++ b/file-history.sh
+@@ -61,11 +61,13 @@
+   file-history.sh commit|ci FILE [message...]
+   file-history.sh diff FILE
+   file-history.sh vimdiff FILE
++  file-history.sh log FILE
+ 
+ Commands:
+   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
+   diff         Show working diff between .FILE.base and FILE (like git diff)
+   vimdiff      Open interactive diff between .FILE.base and FILE
++  log          List recorded patch commits from .FILE.patches.mbox
+ 
+ Notes:
+   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
+@@ -138,7 +140,7 @@
+ shift
+ 
+ case "$cmd" in
+-  commit|ci|diff|vimdiff)
++  commit|ci|diff|vimdiff|log)
+     ;;
+   *)
+     usage
+@@ -150,7 +152,7 @@
+ file="$1"
+ shift || true
+ 
+-if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" ]] && [ $# -ne 0 ]; then
++if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" ]] && [ $# -ne 0 ]; then
+   usage
+ fi
+ 
+@@ -170,6 +172,63 @@
+   [ -z "$msg" ] && msg="no message"
+ fi
+ 
++if [ "$cmd" = "log" ]; then
++  if [ ! -f "$mbox" ]; then
++    echo "No recorded history for '$file'"
++    exit 0
++  fi
++
++  awk '
++    BEGIN {
++      n = 0
++      date = "-"
++      in_subject = 0
++      subject = ""
++    }
++
++    function flush_subject() {
++      if (in_subject) {
++        n++
++        printf "%4d  %s  %s\n", n, date, subject
++        date = "-"
++        in_subject = 0
++        subject = ""
++      }
++    }
++
++    {
++      if (in_subject && $0 !~ /^[ \t]/) {
++        flush_subject()
++      }
++    }
++
++    /^Date: / {
++      date = substr($0, 7)
++      next
++    }
++
++    /^Subject: \[PATCH[^]]*\] / {
++      subject = $0
++      sub(/^Subject: \[PATCH[^]]*\] /, "", subject)
++      in_subject = 1
++      next
++    }
++
++    in_subject && /^[ \t]/ {
++      line = $0
++      sub(/^[ \t]+/, "", line)
++      subject = subject " " line
++      next
++    }
++
++    END {
++      flush_subject()
++    }
++  ' "$mbox"
++
++  exit 0
++fi
++
+ # If base is missing, try to reconstruct from existing mbox history.
+ ensure_base_from_mbox "$file" "$base" "$mbox" "$name"
+ 
+
+From 5eb604c01c18971cc7deec215ebb24cc1269b345 Sat May 02 13:38:54 2026
+From: Adi Zaimi <adizaimi@yahoo.com>
+Date: Sat, 02 May 2026 13:38:54 -0400
+Subject: [PATCH] Add parameter show to print the last patch entry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--- a/file-history.sh
++++ b/file-history.sh
+@@ -62,12 +62,14 @@
+   file-history.sh diff FILE
+   file-history.sh vimdiff FILE
+   file-history.sh log FILE
++  file-history.sh show FILE
+ 
+ Commands:
+   commit, ci   Record a patch email into .FILE.patches.mbox and update .FILE.base
+   diff         Show working diff between .FILE.base and FILE (like git diff)
+   vimdiff      Open interactive diff between .FILE.base and FILE
+   log          List recorded patch commits from .FILE.patches.mbox
++  show         Print the last patch entry from .FILE.patches.mbox (like git show)
+ 
+ Notes:
+   - If .FILE.base is missing but .FILE.patches.mbox exists, base is reconstructed
+@@ -140,7 +142,7 @@
+ shift
+ 
+ case "$cmd" in
+-  commit|ci|diff|vimdiff|log)
++  commit|ci|diff|vimdiff|log|show)
+     ;;
+   *)
+     usage
+@@ -152,7 +154,7 @@
+ file="$1"
+ shift || true
+ 
+-if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" ]] && [ $# -ne 0 ]; then
++if [[ "$cmd" = "diff" || "$cmd" = "vimdiff" || "$cmd" = "log" || "$cmd" = "show" ]] && [ $# -ne 0 ]; then
+   usage
+ fi
+ 
+@@ -223,7 +225,49 @@
+ 
+     END {
+       flush_subject()
++    }
++  ' "$mbox"
++
++  exit 0
++fi
++
++if [ "$cmd" = "show" ]; then
++  if [ ! -f "$mbox" ]; then
++    echo "No recorded history for '$file'"
++    exit 0
++  fi
++
++  awk '
++    BEGIN {
++      have_last = 0
++      current = ""
++    }
++
++    /^From [0-9a-f][0-9a-f]* / {
++      if (current != "") {
++        last = current
++        have_last = 1
++      }
++      current = $0 ORS
++      next
+     }
++
++    {
++      current = current $0 ORS
++    }
++
++    END {
++      if (current != "") {
++        last = current
++        have_last = 1
++      }
++
++      if (!have_last) {
++        exit 1
++      }
++
++      printf "%s", last
++    }
+   ' "$mbox"
+ 
+   exit 0
+
